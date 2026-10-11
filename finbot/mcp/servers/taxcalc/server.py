@@ -150,10 +150,27 @@ def create_taxcalc_server(
         Checks if the provided tax ID matches expected formats for the given country.
         Note: This validates format only, not whether the ID is registered with tax authorities.
         """
-        tax_id_clean = re.sub(r"[\s\-]", "", tax_id)
+        tax_id_trimmed = tax_id.strip()
+        tax_id_clean = re.sub(r"[\s\-]", "", tax_id_trimmed)
 
         if country == "US":
-            # EIN format: XX-XXXXXXX (9 digits)
+            # SSN format: XXX-XX-XXXX (3-2-4 grouping, area number cannot be 000)
+            if re.match(r"^\d{3}[\s\-]\d{2}[\s\-]\d{4}$", tax_id_trimmed):
+                if tax_id_clean.startswith("000"):
+                    return {
+                        "tax_id": tax_id,
+                        "country": country,
+                        "format_valid": False,
+                        "error": "Invalid SSN: area number cannot be 000",
+                    }
+                return {
+                    "tax_id": tax_id,
+                    "country": country,
+                    "format_valid": True,
+                    "id_type": "SSN",
+                    "formatted": f"{tax_id_clean[:3]}-{tax_id_clean[3:5]}-{tax_id_clean[5:]}",
+                }
+            # EIN format: XX-XXXXXXX (9 digits, 2-7 grouping or unformatted digits)
             if re.match(r"^\d{9}$", tax_id_clean):
                 return {
                     "tax_id": tax_id,
@@ -162,20 +179,11 @@ def create_taxcalc_server(
                     "id_type": "EIN",
                     "formatted": f"{tax_id_clean[:2]}-{tax_id_clean[2:]}",
                 }
-            # SSN format: XXX-XX-XXXX (9 digits, different grouping)
-            if re.match(r"^\d{9}$", tax_id_clean) and tax_id_clean[:3] != "00":
-                return {
-                    "tax_id": tax_id,
-                    "country": country,
-                    "format_valid": True,
-                    "id_type": "SSN",
-                    "formatted": f"{tax_id_clean[:3]}-{tax_id_clean[3:5]}-{tax_id_clean[5:]}",
-                }
             return {
                 "tax_id": tax_id,
                 "country": country,
                 "format_valid": False,
-                "error": "US tax IDs must be 9 digits (EIN: XX-XXXXXXX)",
+                "error": "US tax IDs must be 9 digits (EIN: XX-XXXXXXX or SSN: XXX-XX-XXXX)",
             }
 
         return {

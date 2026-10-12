@@ -103,6 +103,81 @@ async def test_validate_tax_id_invalid_ssn_spaced_area_zero(taxcalc_server: Any)
     assert "Invalid SSN" in data["error"]
 
 
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validate_tax_id_invalid_ssn_area_666(taxcalc_server: Any) -> None:
+    """SSN with area number 666 is rejected as invalid."""
+    res = await taxcalc_server.call_tool("validate_tax_id", {"tax_id": "666-12-3456"})
+    data = res.structured_content
+    assert data["format_valid"] is False
+    assert "Invalid SSN" in data["error"]
+    assert "666" in data["error"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validate_tax_id_invalid_ssn_spaced_area_666(taxcalc_server: Any) -> None:
+    """Spaced SSN with area number 666 is rejected as invalid."""
+    res = await taxcalc_server.call_tool("validate_tax_id", {"tax_id": "666 12 3456"})
+    data = res.structured_content
+    assert data["format_valid"] is False
+    assert "Invalid SSN" in data["error"]
+    assert "666" in data["error"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validate_tax_id_invalid_ssn_area_900(taxcalc_server: Any) -> None:
+    """SSN with area number 900 is rejected as invalid."""
+    res = await taxcalc_server.call_tool("validate_tax_id", {"tax_id": "900-12-3456"})
+    data = res.structured_content
+    assert data["format_valid"] is False
+    assert "Invalid SSN" in data["error"]
+    assert "900-999" in data["error"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validate_tax_id_invalid_ssn_area_999(taxcalc_server: Any) -> None:
+    """SSN with area number 999 is rejected as invalid."""
+    res = await taxcalc_server.call_tool("validate_tax_id", {"tax_id": "999-12-3456"})
+    data = res.structured_content
+    assert data["format_valid"] is False
+    assert "Invalid SSN" in data["error"]
+    assert "900-999" in data["error"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validate_tax_id_invalid_ssn_spaced_area_900(taxcalc_server: Any) -> None:
+    """Spaced SSN with area number in 900-999 range is rejected as invalid."""
+    res = await taxcalc_server.call_tool("validate_tax_id", {"tax_id": "950 12 3456"})
+    data = res.structured_content
+    assert data["format_valid"] is False
+    assert "Invalid SSN" in data["error"]
+    assert "900-999" in data["error"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validate_tax_id_invalid_ssn_group_zero(taxcalc_server: Any) -> None:
+    """SSN with group number 00 is rejected as invalid."""
+    res = await taxcalc_server.call_tool("validate_tax_id", {"tax_id": "123-00-6789"})
+    data = res.structured_content
+    assert data["format_valid"] is False
+    assert "Invalid SSN" in data["error"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validate_tax_id_invalid_ssn_serial_zero(taxcalc_server: Any) -> None:
+    """SSN with serial number 0000 is rejected as invalid."""
+    res = await taxcalc_server.call_tool("validate_tax_id", {"tax_id": "123-45-0000"})
+    data = res.structured_content
+    assert data["format_valid"] is False
+    assert "Invalid SSN" in data["error"]
+
+
 # ============================================================================
 # Whitespace Handling Tests
 # ============================================================================
@@ -175,6 +250,30 @@ async def test_validate_tax_id_non_numeric_characters(taxcalc_server: Any) -> No
     data = res.structured_content
     assert data["format_valid"] is False
     assert "must be 9 digits" in data["error"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_validate_tax_id_ssn_embedded_in_extra_characters(
+    taxcalc_server: Any,
+) -> None:
+    """A valid SSN embedded within extra characters or text is rejected."""
+    cases = [
+        "prefix 123-45-6789",
+        "123-45-6789 suffix",
+        "prefix 123-45-6789 suffix",
+        "123-45-6789-extra",
+        "extra-123-45-6789",
+        "123 45 6789 extra",
+        "prefix 123 45 6789",
+        "Tax ID: 123-45-6789",
+        "A123-45-6789",
+        "123-45-6789B",
+    ]
+    for case in cases:
+        res = await taxcalc_server.call_tool("validate_tax_id", {"tax_id": case})
+        data = res.structured_content
+        assert data["format_valid"] is False, f"Expected {case!r} to be rejected"
 
 
 # ============================================================================

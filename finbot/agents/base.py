@@ -82,13 +82,16 @@ class BaseAgent(ABC):
 
         Guarantees:
         1. Always returns a valid string (preventing LLM client schema crashes).
-        2. Enforces a maximum character length (AGENT_MAX_TOOL_OUTPUT_LENGTH) with a
-           clean truncation notification to prevent context-window exhaustion and DoS.
-        3. Neutralizes raw template control tokens (e.g. ChatML role delimiters) that
-           could attempt container escapes into privileged message channels.
-        4. Detects high-confidence prompt injection override markers and records
-           security telemetry without breaking legitimate business data or CTF scenarios.
+        2. Enforces a strict upper bound on output length (including truncation notices)
+           to prevent context-window exhaustion and denial-of-service.
+        3. Falls back gracefully for non-serializable objects, circular references, or
+           recursion errors without crashing the agent loop or corrupting conversation state.
+        4. Neutralizes raw chat-template escape delimiters (e.g. ChatML role boundaries)
+           to prevent delimiter collision in local/tokenizer template expansions.
+        5. Logs security warnings for direct prompt injection override markers without
+           leaking payload contents or breaking legitimate business data / CTF scenarios.
         """
+        # 1. Type normalization & serialization
         if function_output is None:
             output_str = "{}"
         elif isinstance(function_output, str):
@@ -100,7 +103,7 @@ class BaseAgent(ABC):
                 try:
                     output_str = str(function_output)
                 except Exception as e:
-                    output_str = f"[Serialization Error: Failed to serialize output for tool '{tool_call_name}': {e}]"
+                    output_str = f"[Serialization Error: Failed to serialize output for tool '{tool_call_name}': {type(e).__name__}]"
         else:
             try:
                 output_str = json.dumps(function_output, ensure_ascii=False, default=str)
@@ -108,12 +111,12 @@ class BaseAgent(ABC):
                 try:
                     output_str = str(function_output)
                 except Exception as e:
-                    output_str = f"[Serialization Error: Non-serializable output of type '{type(function_output).__name__}' for tool '{tool_call_name}': {e}]"
+                    output_str = f"[Serialization Error: Non-serializable output of type '{type(function_output).__name__}' for tool '{tool_call_name}': {type(e).__name__}]"
 
         if not isinstance(output_str, str):
             output_str = str(output_str)
 
-        # Neutralize raw chat-template escape delimiters
+        # 2. Neutralize raw chat-template escape delimiters
         for delimiter in (
             "<|im_start|>",
             "<|im_end|>",
@@ -125,19 +128,36 @@ class BaseAgent(ABC):
                 escaped = delimiter.replace("<|", "< |")
                 output_str = output_str.replace(delimiter, escaped)
 
-        # Defense-in-depth: check for direct prompt injection override markers
+        # 3. Defense-in-depth: check for direct prompt injection override markers
         self._check_and_log_injection_patterns(tool_call_name, output_str)
 
-        # Enforce maximum tool output length
-        max_length = self.agent_config.get(
+        # 4. Enforce strict maximum tool output length
+        raw_max = self.agent_config.get(
             "max_tool_output_length", settings.AGENT_MAX_TOOL_OUTPUT_LENGTH
         )
-        if isinstance(max_length, int) and max_length > 0 and len(output_str) > max_length:
-            omitted = len(output_str) - max_length
-            output_str = (
-                output_str[:max_length]
-                + f"\n\n[Output truncated: {omitted} characters exceeded limit of {max_length}]"
-            )
+        try:
+            max_length = int(raw_max)
+            if max_length <= 0:
+                max_length = settings.AGENT_MAX_TOOL_OUTPUT_LENGTH
+        except (ValueError, TypeError):
+            max_length = settings.AGENT_MAX_TOOL_OUTPUT_LENGTH
+
+        if len(output_str) > max_length:
+            notice_prefix = "\n\n[Output truncated: "
+            notice_suffix = f" characters exceeded limit of {max_length}]"
+            omitted_estimate = len(output_str) - max_length
+            notice = f"{notice_prefix}{omitted_estimate}{notice_suffix}"
+            if max_length > len(notice) + 10:
+                content_len = max_length - len(notice)
+                omitted = len(output_str) - content_len
+                notice = f"{notice_prefix}{omitted}{notice_suffix}"
+                if content_len + len(notice) > max_length:
+                    content_len -= content_len + len(notice) - max_length
+                    omitted = len(output_str) - content_len
+                    notice = f"{notice_prefix}{omitted}{notice_suffix}"
+                output_str = output_str[:content_len] + notice
+            else:
+                output_str = output_str[:max_length]
 
         return output_str
 
@@ -146,18 +166,31 @@ class BaseAgent(ABC):
         tool_call_name: str,
         output_str: str,
     ) -> None:
-        """Scan tool output for direct instruction override markers and log security telemetry."""
+        """Scan tool output for direct instruction override markers and log security telemetry.
+
+        Logs are strictly bounded and do not leak vendor data, invoice contents, or credentials.
+        """
         injection_patterns = (
-            r"(?i)\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above)\s+(?:instructions|prompts|directives|rules)",
-            r"(?i)\b(?:you\s+are\s+now|act\s+as\s+a?)\s+(?:DAN|developer\s+mode|unrestricted|jailbreak)",
-            r"(?i)\b(?:system\s+prompt\s+override|elevated\s+instruction)\b",
+            (
+                r"(?i)\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above)\s+(?:instructions|prompts|directives|rules)",
+                "instruction_override",
+            ),
+            (
+                r"(?i)\b(?:you\s+are\s+now|act\s+as\s+a?)\s+(?:DAN|developer\s+mode|unrestricted|jailbreak)",
+                "persona_hijack",
+            ),
+            (
+                r"(?i)\b(?:system\s+prompt\s+override|elevated\s+instruction)\b",
+                "privilege_escalation",
+            ),
         )
-        for pattern in injection_patterns:
+        for pattern, category in injection_patterns:
             if re.search(pattern, output_str):
                 logger.warning(
-                    "Potential prompt injection pattern detected in tool output for '%s' in agent '%s'",
+                    "Potential prompt injection pattern detected in tool output for '%s' in agent '%s' (category: %s)",
                     tool_call_name,
                     self.agent_name,
+                    category,
                 )
                 break
 

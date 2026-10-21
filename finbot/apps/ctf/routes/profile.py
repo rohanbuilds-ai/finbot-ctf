@@ -66,9 +66,14 @@ def is_ip_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return not any(ip in net for net in BLOCKED_NETWORKS)
 
 
-def validate_avatar_url(url: str) -> None:
+async def validate_avatar_url(url: str) -> None:
     """Validate that an avatar URL uses HTTPS and resolves exclusively to safe public IPs."""
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        port = parsed.port or 443
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid avatar URL: Malformed URL or port")
+
     if parsed.scheme != "https":
         raise HTTPException(status_code=400, detail="Invalid avatar URL: Must use HTTPS")
 
@@ -78,10 +83,9 @@ def validate_avatar_url(url: str) -> None:
             status_code=400, detail="Invalid avatar URL: Malformed hostname or credentials"
         )
 
-    port = parsed.port or 443
-
     try:
-        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        loop = asyncio.get_running_loop()
+        addr_info = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except socket.gaierror:
         raise HTTPException(
             status_code=400, detail="Invalid avatar URL: Unable to resolve hostname"
@@ -125,11 +129,18 @@ class SSRFProtectedBackend(AnyIOBackend):
         except Exception as exc:
             raise httpcore.ConnectError(f"DNS resolution failed for {host}") from exc
 
-        ips = {info[4][0] for info in addr_info}
-        if not ips:
+        # Collect distinct IPs preserving DNS resolution order
+        resolved_ips: list[str] = []
+        for info in addr_info:
+            ip_str = info[4][0]
+            if ip_str not in resolved_ips:
+                resolved_ips.append(ip_str)
+
+        if not resolved_ips:
             raise httpcore.ConnectError(f"No addresses resolved for {host}")
 
-        for ip_str in ips:
+        # Fail closed immediately if ANY resolved IP is prohibited or malformed
+        for ip_str in resolved_ips:
             try:
                 ip = ipaddress.ip_address(ip_str)
             except ValueError as exc:
@@ -138,15 +149,23 @@ class SSRFProtectedBackend(AnyIOBackend):
             if not is_ip_allowed(ip):
                 raise httpcore.ConnectError(f"Prohibited destination IP: {ip_str}")
 
-        # Pin connection to the first verified safe IP to eliminate TOCTOU / DNS rebinding
-        safe_ip = next(iter(ips))
-        return await super().connect_tcp(
-            safe_ip,
-            port,
-            timeout=timeout,
-            local_address=local_address,
-            socket_options=socket_options,
-        )
+        # Connect to verified safe IPs in order (dual-stack fallback without DNS rebinding)
+        last_exc: Exception | None = None
+        for safe_ip in resolved_ips:
+            try:
+                return await super().connect_tcp(
+                    safe_ip,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except Exception as exc:
+                last_exc = exc
+
+        if last_exc:
+            raise last_exc
+        raise httpcore.ConnectError(f"Failed to connect to any resolved IP for {host}")
 
 
 def make_ssrf_safe_transport(**kwargs) -> httpx.AsyncHTTPTransport:
@@ -485,7 +504,7 @@ async def update_profile(
     )
 
     if effective_avatar_type == "url" and effective_avatar_url:
-        validate_avatar_url(effective_avatar_url)
+        await validate_avatar_url(effective_avatar_url)
 
     # Update other fields
     profile = profile_repo.update_profile(

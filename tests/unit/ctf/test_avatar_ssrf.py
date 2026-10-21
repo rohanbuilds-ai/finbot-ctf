@@ -292,3 +292,191 @@ class TestAvatarSSRFRegression:
 
             assert res is not None
             mock_update.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "malformed_url",
+        [
+            "https://example.com:99999999/avatar.png",  # Out-of-range port
+            "https://example.com:abc/avatar.png",  # Non-integer port
+            "https://example.com:-1/avatar.png",  # Negative port
+            "https://[invalid-ipv6/avatar.png",  # Malformed IPv6 syntax
+            "https://user:pass@example.com/avatar.png",  # Embedded credentials
+            "https:///avatar.png",  # Empty hostname
+            "https://:443/avatar.png",  # Missing hostname with port
+        ],
+    )
+    async def test_update_avatar_url_rejects_malformed_url_and_ports(
+        self, session_context, mock_db, mock_profile, malformed_url
+    ):
+        """Malformed URLs, invalid ports, and embedded credentials must return HTTP 400, never 500."""
+        request = ProfileUpdateRequest(avatar_type="url", avatar_url=malformed_url)
+
+        with (
+            patch(
+                "finbot.core.data.repositories.UserProfileRepository.get_by_user_id",
+                return_value=mock_profile,
+            ),
+            patch(
+                "finbot.core.data.repositories.UserProfileRepository.update_profile",
+                return_value=mock_profile,
+            ) as mock_update,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await update_profile(
+                    request=request,
+                    session_context=session_context,
+                    db=mock_db,
+                )
+
+            assert exc_info.value.status_code == 400
+            mock_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mapped_ip",
+        [
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.1.1",
+        ],
+    )
+    async def test_update_avatar_url_rejects_ipv4_mapped_ipv6_prohibited(
+        self, session_context, mock_db, mock_profile, mapped_ip
+    ):
+        """IPv4-mapped IPv6 addresses representing prohibited targets must be blocked."""
+        url = f"https://[{mapped_ip}]/avatar.png"
+        request = ProfileUpdateRequest(avatar_type="url", avatar_url=url)
+
+        def mock_getaddrinfo(host, port, *args, **kwargs):
+            return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (mapped_ip, 443))]
+
+        with (
+            patch(
+                "finbot.core.data.repositories.UserProfileRepository.get_by_user_id",
+                return_value=mock_profile,
+            ),
+            patch("socket.getaddrinfo", side_effect=mock_getaddrinfo),
+            patch(
+                "finbot.core.data.repositories.UserProfileRepository.update_profile",
+                return_value=mock_profile,
+            ) as mock_update,
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await update_profile(
+                    request=request,
+                    session_context=session_context,
+                    db=mock_db,
+                )
+
+            assert exc_info.value.status_code == 400
+            mock_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ssrf_protected_backend_dual_stack_failover(self):
+        """SSRFProtectedBackend should fail over to subsequent safe resolved IPs if the first one is unreachable."""
+        import asyncio
+
+        import httpcore
+
+        from finbot.apps.ctf.routes.profile import SSRFProtectedBackend
+
+        backend = SSRFProtectedBackend()
+        loop = asyncio.get_running_loop()
+
+        # Returns IPv6 first, then IPv4
+        mock_addrinfo = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:4700::6810:85e5", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+        ]
+
+        attempted_ips = []
+
+        async def fake_super_connect(ip, port, **kwargs):
+            attempted_ips.append(ip)
+            if ip == "2606:4700::6810:85e5":
+                raise httpcore.ConnectError("IPv6 network unreachable")
+            mock_stream = MagicMock()
+            return mock_stream
+
+        with (
+            patch.object(loop, "getaddrinfo", new_callable=AsyncMock, return_value=mock_addrinfo),
+            patch(
+                "httpcore._backends.anyio.AnyIOBackend.connect_tcp", side_effect=fake_super_connect
+            ),
+        ):
+            stream = await backend.connect_tcp(host="example.com", port=443)
+            assert stream is not None
+            assert attempted_ips == ["2606:4700::6810:85e5", "93.184.216.34"]
+
+    @pytest.mark.asyncio
+    async def test_ssrf_protected_backend_mixed_dns_fails_closed(self):
+        """SSRFProtectedBackend must fail closed if DNS returns mixed safe and prohibited IPs."""
+        import asyncio
+
+        import httpcore
+
+        from finbot.apps.ctf.routes.profile import SSRFProtectedBackend
+
+        backend = SSRFProtectedBackend()
+        loop = asyncio.get_running_loop()
+
+        # Mixed DNS: safe public IP + internal private IP
+        mock_addrinfo = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 443)),
+        ]
+
+        with (
+            patch.object(loop, "getaddrinfo", new_callable=AsyncMock, return_value=mock_addrinfo),
+            patch(
+                "httpcore._backends.anyio.AnyIOBackend.connect_tcp", new_callable=AsyncMock
+            ) as mock_connect,
+        ):
+            with pytest.raises(httpcore.ConnectError) as exc_info:
+                await backend.connect_tcp(host="rebound-trap.evil", port=443)
+
+            assert "Prohibited destination IP: 10.0.0.1" in str(exc_info.value)
+            mock_connect.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ssrf_protected_backend_preserves_tls_sni_hostname(self):
+        """Verify that connection-time IP pinning connects to IP while TLS handshake uses the original domain name."""
+        import asyncio
+
+        import httpcore
+
+        from finbot.apps.ctf.routes.profile import SSRFProtectedBackend
+
+        backend = SSRFProtectedBackend()
+        loop = asyncio.get_running_loop()
+
+        mock_addrinfo = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+        ]
+
+        mock_stream = AsyncMock()
+        mock_stream.start_tls = AsyncMock(return_value=mock_stream)
+
+        with (
+            patch.object(loop, "getaddrinfo", new_callable=AsyncMock, return_value=mock_addrinfo),
+            patch(
+                "httpcore._backends.anyio.AnyIOBackend.connect_tcp",
+                new_callable=AsyncMock,
+                return_value=mock_stream,
+            ) as mock_super_connect,
+        ):
+            stream = await backend.connect_tcp(host="secure-avatar.example.org", port=443)
+            # TCP connection is pinned to verified safe IP
+            mock_super_connect.assert_called_once()
+            args, kwargs = mock_super_connect.call_args
+            connected_target = args[0] if args else kwargs.get("host")
+            assert connected_target == "93.184.216.34"
+
+            # Simulate httpcore._connect TLS handshake invocation on the stream
+            req_origin_host = "secure-avatar.example.org"
+            await stream.start_tls(ssl_context=MagicMock(), server_hostname=req_origin_host)
+            mock_stream.start_tls.assert_called_once()
+            _, tls_kwargs = mock_stream.start_tls.call_args
+            assert tls_kwargs["server_hostname"] == "secure-avatar.example.org"

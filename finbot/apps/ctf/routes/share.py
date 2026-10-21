@@ -94,7 +94,7 @@ async def _fetch_avatar_b64(url: str) -> str:
     Returns empty string on any failure (timeout, bad content type, too large, SSRF blocked).
     """
     try:
-        validate_avatar_url(url)
+        await validate_avatar_url(url)
     except Exception:
         return ""
 

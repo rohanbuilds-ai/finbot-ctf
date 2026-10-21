@@ -82,18 +82,22 @@ class BaseAgent(ABC):
 
         Guarantees:
         1. Always returns a valid string (preventing LLM client schema crashes).
-        2. Enforces a strict upper bound on output length (including truncation notices)
+        2. Preserves valid JSON envelopes for structured outputs (dict/list) when truncated.
+        3. Enforces a strict upper bound on output length (including truncation notices)
            to prevent context-window exhaustion and denial-of-service.
-        3. Falls back gracefully for non-serializable objects, circular references, or
+        4. Falls back gracefully for non-serializable objects, circular references, or
            recursion errors without crashing the agent loop or corrupting conversation state.
-        4. Neutralizes raw chat-template escape delimiters (e.g. ChatML role boundaries)
+        5. Neutralizes raw chat-template escape delimiters (e.g. ChatML role boundaries)
            to prevent delimiter collision in local/tokenizer template expansions.
-        5. Logs security warnings for direct prompt injection override markers without
-           leaking payload contents or breaking legitimate business data / CTF scenarios.
+        6. Logs security telemetry for prompt injection patterns, and blocks injection
+           if configured via block_prompt_injection.
         """
+        is_structured = isinstance(function_output, (dict, list))
+
         # 1. Type normalization & serialization
         if function_output is None:
             output_str = "{}"
+            is_structured = True
         elif isinstance(function_output, str):
             output_str = function_output
         elif isinstance(function_output, (dict, list, int, float, bool)):
@@ -102,16 +106,20 @@ class BaseAgent(ABC):
             except Exception:
                 try:
                     output_str = str(function_output)
+                    is_structured = False
                 except Exception as e:
                     output_str = f"[Serialization Error: Failed to serialize output for tool '{tool_call_name}': {type(e).__name__}]"
+                    is_structured = False
         else:
             try:
                 output_str = json.dumps(function_output, ensure_ascii=False, default=str)
             except Exception:
                 try:
                     output_str = str(function_output)
+                    is_structured = False
                 except Exception as e:
                     output_str = f"[Serialization Error: Non-serializable output of type '{type(function_output).__name__}' for tool '{tool_call_name}': {type(e).__name__}]"
+                    is_structured = False
 
         if not isinstance(output_str, str):
             output_str = str(output_str)
@@ -129,9 +137,27 @@ class BaseAgent(ABC):
                 output_str = output_str.replace(delimiter, escaped)
 
         # 3. Defense-in-depth: check for direct prompt injection override markers
-        self._check_and_log_injection_patterns(tool_call_name, output_str)
+        has_injection = self._check_and_log_injection_patterns(tool_call_name, output_str)
 
-        # 4. Enforce strict maximum tool output length
+        # 4. Optional prompt injection blocking (for hardened/production mode)
+        block_injection = bool(
+            self.agent_config.get(
+                "block_prompt_injection",
+                settings.AGENT_BLOCK_PROMPT_INJECTION,
+            )
+        )
+        if has_injection and block_injection:
+            if is_structured:
+                return json.dumps(
+                    {
+                        "error": "Content blocked: potential prompt injection detected in tool output",
+                        "blocked": True,
+                    },
+                    ensure_ascii=False,
+                )
+            return "[Content blocked: potential prompt injection detected in tool output]"
+
+        # 5. Enforce strict maximum tool output length
         raw_max = self.agent_config.get(
             "max_tool_output_length", settings.AGENT_MAX_TOOL_OUTPUT_LENGTH
         )
@@ -143,32 +169,69 @@ class BaseAgent(ABC):
             max_length = settings.AGENT_MAX_TOOL_OUTPUT_LENGTH
 
         if len(output_str) > max_length:
-            notice_prefix = "\n\n[Output truncated: "
-            notice_suffix = f" characters exceeded limit of {max_length}]"
-            omitted_estimate = len(output_str) - max_length
-            notice = f"{notice_prefix}{omitted_estimate}{notice_suffix}"
-            if max_length > len(notice) + 10:
-                content_len = max_length - len(notice)
-                omitted = len(output_str) - content_len
-                notice = f"{notice_prefix}{omitted}{notice_suffix}"
-                if content_len + len(notice) > max_length:
-                    content_len -= content_len + len(notice) - max_length
-                    omitted = len(output_str) - content_len
-                    notice = f"{notice_prefix}{omitted}{notice_suffix}"
-                output_str = output_str[:content_len] + notice
+            if is_structured:
+                output_str = self._truncate_json_structure(output_str, max_length)
             else:
-                output_str = output_str[:max_length]
+                output_str = self._truncate_text_output(output_str, max_length)
 
         return output_str
+
+    @staticmethod
+    def _truncate_json_structure(output_str: str, max_length: int) -> str:
+        """Truncate serialized structured output while preserving valid JSON and strict length bounding."""
+        notice = f"Output exceeded limit of {max_length} characters and was truncated."
+        envelope: dict[str, Any] = {
+            "_truncated": True,
+            "_limit": max_length,
+            "_notice": notice,
+            "excerpt": "",
+        }
+        base_json = json.dumps(envelope, ensure_ascii=False)
+        if len(base_json) > max_length:
+            envelope = {"_truncated": True, "excerpt": ""}
+            base_json = json.dumps(envelope, ensure_ascii=False)
+            if len(base_json) > max_length:
+                return output_str[:max_length]
+
+        overhead = len(base_json)
+        avail = max_length - overhead
+        candidate = output_str[:avail]
+        envelope["excerpt"] = candidate
+        candidate_json = json.dumps(envelope, ensure_ascii=False)
+        while len(candidate_json) > max_length and avail > 0:
+            avail -= max(1, len(candidate_json) - max_length)
+            envelope["excerpt"] = output_str[:avail]
+            candidate_json = json.dumps(envelope, ensure_ascii=False)
+
+        return candidate_json
+
+    @staticmethod
+    def _truncate_text_output(output_str: str, max_length: int) -> str:
+        """Truncate raw text tool output with an explicit notice while strictly bounding length."""
+        notice_prefix = "\n\n[Output truncated: "
+        notice_suffix = f" characters exceeded limit of {max_length}]"
+        omitted_estimate = len(output_str) - max_length
+        notice = f"{notice_prefix}{omitted_estimate}{notice_suffix}"
+        if max_length > len(notice) + 10:
+            content_len = max_length - len(notice)
+            omitted = len(output_str) - content_len
+            notice = f"{notice_prefix}{omitted}{notice_suffix}"
+            if content_len + len(notice) > max_length:
+                content_len -= content_len + len(notice) - max_length
+                omitted = len(output_str) - content_len
+                notice = f"{notice_prefix}{omitted}{notice_suffix}"
+            return output_str[:content_len] + notice
+        return output_str[:max_length]
 
     def _check_and_log_injection_patterns(
         self,
         tool_call_name: str,
         output_str: str,
-    ) -> None:
+    ) -> bool:
         """Scan tool output for direct instruction override markers and log security telemetry.
 
         Logs are strictly bounded and do not leak vendor data, invoice contents, or credentials.
+        Returns True if a prompt injection pattern was detected, False otherwise.
         """
         injection_patterns = (
             (
@@ -184,6 +247,7 @@ class BaseAgent(ABC):
                 "privilege_escalation",
             ),
         )
+        detected = False
         for pattern, category in injection_patterns:
             if re.search(pattern, output_str):
                 logger.warning(
@@ -192,7 +256,9 @@ class BaseAgent(ABC):
                     self.agent_name,
                     category,
                 )
+                detected = True
                 break
+        return detected
 
     async def _run_agent_loop(self, task_data: dict[str, Any] | None = None) -> dict[str, Any]:
         """

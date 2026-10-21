@@ -108,6 +108,9 @@ class Settings(BaseSettings):
     AGENT_MAX_TOOL_OUTPUT_LENGTH: int = (
         25000  # Max character length for tool outputs in LLM context
     )
+    AGENT_BLOCK_PROMPT_INJECTION: bool = (
+        False  # Whether to block suspicious prompt injection tool output (default False for CTF)
+    )
 
     # OpenAI Config
     OPENAI_API_KEY: str = ""

@@ -23,15 +23,19 @@ from finbot.core.data.repositories import (
     UserProfileRepository,
 )
 
-from .profile import calculate_level, resolve_avatar_url, xp_progress
+from .profile import (
+    calculate_level,
+    make_ssrf_safe_transport,
+    resolve_avatar_url,
+    validate_avatar_url,
+    xp_progress,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/share", tags=["share"])
 
 CACHE_DIR = (
-    Path(settings.DATA_DIR if hasattr(settings, "DATA_DIR") else ".")
-    / "cache"
-    / "share_cards"
+    Path(settings.DATA_DIR if hasattr(settings, "DATA_DIR") else ".") / "cache" / "share_cards"
 )
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -48,12 +52,8 @@ RARITY_COLORS_HEX = {
     "legendary": "#fbbf24",
 }
 
-_STATIC_IMAGES = (
-    Path(__file__).parent.parent.parent.parent / "static" / "images" / "common"
-)
-_BADGE_IMAGES = (
-    Path(__file__).parent.parent.parent.parent / "static" / "images" / "ctf" / "badges"
-)
+_STATIC_IMAGES = Path(__file__).parent.parent.parent.parent / "static" / "images" / "common"
+_BADGE_IMAGES = Path(__file__).parent.parent.parent.parent / "static" / "images" / "ctf" / "badges"
 _b64_cache: dict[str, str] = {}
 
 
@@ -63,9 +63,7 @@ def _get_image_b64(filename: str) -> str:
         return _b64_cache[filename]
 
     try:
-        _b64_cache[filename] = base64.b64encode(
-            (_STATIC_IMAGES / filename).read_bytes()
-        ).decode()
+        _b64_cache[filename] = base64.b64encode((_STATIC_IMAGES / filename).read_bytes()).decode()
     except (OSError, IOError):
         _b64_cache[filename] = ""
     return _b64_cache[filename]
@@ -93,10 +91,18 @@ def get_cache_path(cache_key: str) -> Path:
 async def _fetch_avatar_b64(url: str) -> str:
     """Fetch a remote avatar image and return it as a base64 data URI.
 
-    Returns empty string on any failure (timeout, bad content type, too large).
+    Returns empty string on any failure (timeout, bad content type, too large, SSRF blocked).
     """
     try:
-        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+        validate_avatar_url(url)
+    except Exception:
+        return ""
+
+    try:
+        transport = make_ssrf_safe_transport()
+        async with httpx.AsyncClient(
+            timeout=5.0, follow_redirects=False, transport=transport
+        ) as client:
             resp = await client.get(url)
             if resp.status_code != 200:
                 return ""
@@ -183,9 +189,7 @@ async def get_profile_card(
     request: Request,
     username: str,
     db: Session = Depends(get_db),
-    html: bool = Query(
-        False, description="Return raw HTML instead of PNG (debug mode)"
-    ),
+    html: bool = Query(False, description="Return raw HTML instead of PNG (debug mode)"),
 ):
     """Generate and return a profile share card image."""
     profile_repo = UserProfileRepository(db)
@@ -284,9 +288,7 @@ async def get_profile_card(
     if html and settings.DEBUG:
         return HTMLResponse(_render_html("profile_card.html", template_context))
 
-    cache_data = (
-        f"{username}:{total_points}:{len(earned_badges)}:{len(completed_progress)}"
-    )
+    cache_data = f"{username}:{total_points}:{len(earned_badges)}:{len(completed_progress)}"
     cache_key = hashlib.md5(cache_data.encode()).hexdigest()
     cache_path = get_cache_path(cache_key)
 
@@ -319,9 +321,7 @@ async def get_user_badge_card(
     username: str,
     badge_id: str,
     db: Session = Depends(get_db),
-    html: bool = Query(
-        False, description="Return raw HTML instead of PNG (debug mode)"
-    ),
+    html: bool = Query(False, description="Return raw HTML instead of PNG (debug mode)"),
 ):
     """Generate a personalized badge card showing the user earned this badge."""
     profile_repo = UserProfileRepository(db)

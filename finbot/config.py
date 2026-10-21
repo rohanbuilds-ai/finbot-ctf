@@ -109,7 +109,7 @@ class Settings(BaseSettings):
         25000  # Max character length for tool outputs in LLM context
     )
     AGENT_BLOCK_PROMPT_INJECTION: bool = (
-        False  # Whether to block suspicious prompt injection tool output (default False for CTF)
+        True  # Block suspicious prompt injection tool output by default (Issue #199)
     )
 
     # OpenAI Config

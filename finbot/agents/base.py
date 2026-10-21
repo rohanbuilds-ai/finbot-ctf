@@ -89,8 +89,9 @@ class BaseAgent(ABC):
            recursion errors without crashing the agent loop or corrupting conversation state.
         5. Neutralizes raw chat-template escape delimiters (e.g. ChatML role boundaries)
            to prevent delimiter collision in local/tokenizer template expansions.
-        6. Logs security telemetry for prompt injection patterns, and blocks injection
-           if configured via block_prompt_injection.
+        6. Scans for direct prompt injection override markers and blocks suspicious output
+           by default (configurable via settings.AGENT_BLOCK_PROMPT_INJECTION and per-agent
+           agent_config["block_prompt_injection"]). Emits redacted security telemetry warnings.
         """
         is_structured = isinstance(function_output, (dict, list))
 
